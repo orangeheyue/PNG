@@ -1,7 +1,8 @@
+<!-- PROJECT LOGO -->
 <br />
 <div align="center">
-  <a href="https://github.com/orangeheyue/GenRec-V1">
-    <img src="static/PNGLOGO.png" alt="Logo" width="400" height="200">
+  <a href="https://github.com/orangeheyue/PNG">
+    <img src="static/PNGLOGO.png" alt="Logo" width="400" height="350">
   </a>
 </div>
 
