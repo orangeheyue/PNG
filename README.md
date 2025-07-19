@@ -4,6 +4,7 @@
     <img src="static/PNGLOGO.png" alt="Logo" width="400" height="200">
   </a>
 </div>
+
 # PNG
 ## Popular-Niche Wavelet Graph Learning for Multimodal Recommendation
 
