@@ -1,587 +1,250 @@
-"""
-Author: orangeheyue@gmail
-Paper Reference:
-	IEEE AAAI 2026: PNG: Popular-Niche Wavelet Graph Learning for Multimodal Recommendation
-Sourece Code:
-	https://github.com/orangeheyue/PNG
-"""
-
-import os
-import numpy as np
-import scipy.sparse as sp
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import sys
-import math
-import pywt
-from common.abstract_recommender import GeneralRecommender
-from utils.utils import build_sim, compute_normalized_laplacian, build_knn_neighbourhood, build_knn_normalized_graph
-
-from pytorch_wavelets import DWT1DForward, DWT1DInverse 
-from models.MMWI import MultiModalWaveletInterestAttention
-from models.MMWA import MMWaveletAlignModule
-
-from  models.UIG import UIG
-
-
-class PNG(GeneralRecommender):
-	'''
-
-	'''
-	def __init__(self, config, dataset):
-		super(PNG, self).__init__(config, dataset)
-		self.sparse = True
-		self.cl_loss1 = config['cl_loss1']
-		self.cl_loss2 = config['cl_loss2']
-		self.cl_loss3 = config['cl_loss3']
-		self.n_ui_layers = config['n_ui_layers']
-		self.embedding_dim = config['embedding_size']
-		self.n_layers = config['n_layers']
-		self.reg_weight = config['reg_weight']
-		self.image_knn_k = config['image_knn_k']
-		self.text_knn_k = config['text_knn_k']
-		# print("self.text_knn_k:", self.text_knn_k)
-		self.fusion_knn_k = config['fusion_knn_k']
-		self.dropout_rate = config['dropout_rate']
-		self.dropout = nn.Dropout(p=self.dropout_rate)
-		self.MMWA = config['MMWA']
-		self.MMWI = config['MMWI']
-		self.MMCL = config['MMCL']
-		self.temperature = config['temperature']
-		
-		print("Load PNG model with parameters: -------------------- \n")
-		# self.visual_modal_expert = VisualModalExpertNetwork(in_features=4096)
-		# self.text_modal_expert = TextModalExpertNetwork(in_features=384)
-		# self.multi_modal_attenion = MultiModalAttention(embed_dim=64, num_heads=self.attention_heads)
-		
-		#多模态多尺度对齐
-		self.multimodal_multiscale_wavelet_align = MMWaveletAlignModule(wavelet='db4', level=3)
-		# 多模态小波兴趣感知
-		# self.mm_wavelet_interest_aware = MultiModalWaveletInterestAttention(embed_dim=self.embedding_dim)
-		self.mm_wavelet_interest_aware = MultiModalWaveletInterestAttention(embed_dim=self.embedding_dim, wavelet_name='db1',decomp_level=1)
-
-		self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
-		#print("self.interaction_matrix.shape:", self.interaction_matrix.shape) # self.interaction_matrix.shape: # self.interaction_matrix.shape: (26495, 7050)
-		#rint("self.interaction_matrix:", self.interaction_matrix) 
-		self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim)
-		self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim)
-		nn.init.xavier_uniform_(self.user_embedding.weight)
-		nn.init.xavier_uniform_(self.item_id_embedding.weight)
-
-		dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
-
-		#print("self.image_knn_k:", self.image_knn_k)
-		image_adj_file = os.path.join(dataset_path, 'image_adj_{}_{}.pt'.format(self.image_knn_k, self.sparse))
-		text_adj_file = os.path.join(dataset_path, 'text_adj_{}_{}.pt'.format(self.text_knn_k, self.sparse))
-		self.fusion_adj_file = os.path.join(dataset_path, 'fusion_adj_{}_{}.pt'.format(self.fusion_knn_k, self.sparse))
-
-		self.norm_adj = self.get_adj_mat()
-		self.R_sprse_mat = self.R
-		self.R = self.sparse_mx_to_torch_sparse_tensor(self.R).float().to(self.device)
-		
-		print("self.R:", self.R) # User-Item interaction matrix
-		'''
-			self.R: tensor(indices=tensor([[    0,     0,     0,  ..., 19444, 19444, 19444],
-						[    0,  1587,  1879,  ...,  6959,  7005,  7022]]),
-		values=tensor([0.1925, 0.0358, 0.1826,  ..., 0.1543, 0.0870, 0.1054]),
-		device='cuda:0', size=(19445, 7050), nnz=118551, layout=torch.sparse_coo)
-		'''
-		#print("self.R.shape:", self.R.shape) # self.R.shape: torch.Size([19445, 7050])
-		UIG_Model = UIG(self.R, wavelet='haar', level=1)
-		self.UIPG, self.UING = UIG_Model.forward() 
-		print("用户-物品流行兴趣图 UIPG:", self.UIPG) # 用户-物品流行兴趣图 UIPG
-		print("用户-物品小众兴趣图 UING:", self.UING) # 用户-物品小众兴趣图 UING 
-
-		self.norm_adj = self.sparse_mx_to_torch_sparse_tensor(self.norm_adj).float().to(self.device)
-		print("norm_adj:", self.norm_adj) # User+Item-User_Item interaction matrix
-		'''
-			norm_adj: tensor(indices=tensor([[    0,     0,     0,  ..., 26494, 26494, 26494],
-                       [19445, 21032, 21324,  ..., 16778, 17070, 18592]]),
-       values=tensor([0.1925, 0.0358, 0.1826,  ..., 0.0976, 0.0772, 0.0976]),
-       device='cuda:0', size=(26495, 26495), nnz=237102, layout=torch.sparse_coo)
-		'''
-		#print("self.norm_adj.shape:", self.norm_adj.shape) # self.norm_adj.shape: torch.Size([26495, 26495])
-
-		if self.v_feat is not None:
-			self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
-			if os.path.exists(image_adj_file):
-				image_adj = torch.load(image_adj_file)
-			else:
-				image_adj = build_sim(self.image_embedding.weight.detach())
-				image_adj = build_knn_normalized_graph(image_adj, topk=self.image_knn_k, is_sparse=self.sparse,
-													   norm_type='sym')
-				torch.save(image_adj, image_adj_file)
-			self.image_original_adj = image_adj.cuda()
-
-		if self.t_feat is not None:
-			self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
-			if os.path.exists(text_adj_file):
-				text_adj = torch.load(text_adj_file)
-			else:
-				text_adj = build_sim(self.text_embedding.weight.detach())
-				text_adj = build_knn_normalized_graph(text_adj, topk=self.text_knn_k, is_sparse=self.sparse, norm_type='sym')
-				torch.save(text_adj, text_adj_file)
-			self.text_original_adj = text_adj.cuda() 
-
-		# self.fusion_adj = self.max_pool_fusion()
-
-
-
-		if self.v_feat is not None:
-			self.image_trs = nn.Linear(self.v_feat.shape[1], self.embedding_dim)
-		if self.t_feat is not None:
-			self.text_trs = nn.Linear(self.t_feat.shape[1], self.embedding_dim)
-
-		self.softmax = nn.Softmax(dim=-1)
-
-		self.query_v = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Tanh(),
-			nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
-		)
-		self.query_t = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Tanh(),
-			nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
-		)
-
-		self.gate_v = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Sigmoid()
-		)
-
-		self.gate_t = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Sigmoid()
-		)
-
-		self.gate_f = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Sigmoid()
-		)
-
-		self.gate_image_prefer = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Sigmoid()
-		)
-
-		self.gate_text_prefer = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Sigmoid()
-		)
-		self.gate_fusion_prefer = nn.Sequential(
-			nn.Linear(self.embedding_dim, self.embedding_dim),
-			nn.Sigmoid()
-		)
-
-		self.image_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
-		self.text_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
-		self.fusion_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
-		
-
-	def get_adj_mat(self):
-		adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
-		adj_mat = adj_mat.tolil()
-		R = self.interaction_matrix.tolil()
-
-		adj_mat[:self.n_users, self.n_users:] = R
-		adj_mat[self.n_users:, :self.n_users] = R.T
-		adj_mat = adj_mat.todok()
-
-		def normalized_adj_single(adj):
-			rowsum = np.array(adj.sum(1))
-
-			d_inv = np.power(rowsum, -0.5).flatten()
-			d_inv[np.isinf(d_inv)] = 0.
-			d_mat_inv = sp.diags(d_inv)
-
-			norm_adj = d_mat_inv.dot(adj_mat)
-			norm_adj = norm_adj.dot(d_mat_inv)
-			return norm_adj.tocoo()
-
-		norm_adj_mat = normalized_adj_single(adj_mat)
-		norm_adj_mat = norm_adj_mat.tolil()
-		self.R = norm_adj_mat[:self.n_users, self.n_users:]
-		return norm_adj_mat.tocsr()
-
-	def sparse_mx_to_torch_sparse_tensor(self, sparse_mx):
-		"""Convert a scipy sparse matrix to a torch sparse tensor."""
-		sparse_mx = sparse_mx.tocoo().astype(np.float32)
-		indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-		values = torch.from_numpy(sparse_mx.data)
-		shape = torch.Size(sparse_mx.shape)
-		return torch.sparse.FloatTensor(indices, values, shape)
-
-		
-	def build_item_item_fusion_graph(self, fusion_embedding):
-		'''
-			构造item-item fusion graph 
-
-			# TODO : 1. 使用小波变换对Item-Item图进行增强
-		'''
-		if os.path.exists(self.fusion_adj_file):
-			fusion_adj = torch.load(self.fusion_adj_file)
-		else:
-			fusion_adj = build_sim(fusion_embedding.detach())
-			fusion_adj = build_knn_normalized_graph(fusion_adj, topk=self.fusion_knn_k, is_sparse=self.sparse, norm_type='sym')
-			torch.save(fusion_adj, self.fusion_adj_file)
-		
-		return fusion_adj.cuda() 
-
-	def forward(self, adj, train=False):
-		if self.v_feat is not None:
-			image_feats = self.image_trs(self.image_embedding.weight)
-			# print("image_feats.shape:", image_feats.shape) # [7050, 64]
-			# print("text_feats.shape:",text_feats.shape )
-		if self.t_feat is not None:
-			text_feats = self.text_trs(self.text_embedding.weight)
-
-		# if self.v_feat is not None:
-		# 	#image_feats = denoise_norm(self.image_embedding.weight, weight=0.6)
-		# 	image_feats = self.visual_modal_expert(self.image_embedding.weight)
-		# if self.t_feat is not None:
-		# 	#text_feats = denoise_norm(self.text_embedding.weight, weight=0.4)
-		# 	text_feats = self.text_modal_expert(self.text_embedding.weight)
-		
-		# (Multimodal Multi-Sacle Wavelet align, MMWA)
-
-		# TODO: Ablation Study1: TODO MMWA
-		if self.MMWA:
-			image_embedding, text_embedding, fusion_embedding = self.multimodal_multiscale_wavelet_align(image_feats, text_feats)
-			#print("fusion_embedding.shape:", fusion_embedding.shape)
-		else:
-			image_embedding = image_feats
-			text_embedding = text_feats
-			fusion_embedding = torch.zeros_like(image_feats)
-
-		image_item_embeds = torch.multiply(self.item_id_embedding.weight, self.gate_v(image_embedding))
-		text_item_embeds = torch.multiply(self.item_id_embedding.weight, self.gate_t(text_embedding))
-		fusion_item_embeds = torch.multiply(self.item_id_embedding.weight, self.gate_f(fusion_embedding))
-		#interest_fusion, low_freq_interest, high_freq_interest = self.mm_wavelet_interest_aware(image_item_embeds, text_item_embeds, fusion_item_embeds)
-
-		# load or build fusion item-item graph
-		# self.fusion_adj = self.build_item_item_fusion_graph(fusion_embedding)
-
-		#   User-Item (Behavioral) View
-		item_embeds = self.item_id_embedding.weight
-		user_embeds = self.user_embedding.weight
-		ego_embeddings = torch.cat([user_embeds, item_embeds], dim=0)
-		all_embeddings = [ego_embeddings]
-
-		for i in range(self.n_ui_layers):
-			side_embeddings = torch.sparse.mm(adj, ego_embeddings)
-			ego_embeddings = side_embeddings
-			all_embeddings += [ego_embeddings]
-		all_embeddings = torch.stack(all_embeddings, dim=1)
-		all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
-		content_embeds = all_embeddings
-
-		
-		# print("content_embeds.shape:", content_embeds.shape) # content_embeds.shape: torch.Size([26495, 64])
-
-		#   Item-Item Modality Specific and Fusion views
-		#   Image-view
-		if self.sparse:
-			for i in range(self.n_layers):
-				image_item_embeds = torch.sparse.mm(self.image_original_adj, image_item_embeds)
-		else:
-			for i in range(self.n_layers):
-				image_item_embeds = torch.mm(self.image_original_adj, image_item_embeds)
-
-		image_user_embeds = torch.sparse.mm(self.R, image_item_embeds)
-		image_embeds = torch.cat([image_user_embeds, image_item_embeds], dim=0)
-
-		USE_IMAGE_UIPG = True 
-		if USE_IMAGE_UIPG:
-			image_user_embeds_uipg = torch.sparse.mm(self.UIPG, image_item_embeds)
-			image_embeds_uipg = torch.cat([image_user_embeds_uipg, image_item_embeds], dim=0)
-			image_user_embeds_uing = torch.sparse.mm(self.UING, image_item_embeds)
-			image_embeds_uing = torch.cat([image_user_embeds_uing, image_item_embeds], dim=0)
-			image_embeds = image_embeds * image_embeds_uipg * image_embeds_uing
-
-
-		#   Text-view
-		if self.sparse:
-			for i in range(self.n_layers):
-				text_item_embeds = torch.sparse.mm(self.text_original_adj, text_item_embeds)
-		else:
-			for i in range(self.n_layers):
-				text_item_embeds = torch.mm(self.text_original_adj, text_item_embeds)
-		text_user_embeds = torch.sparse.mm(self.R, text_item_embeds)
-		text_embeds = torch.cat([text_user_embeds, text_item_embeds], dim=0)
-
-
-		#  Faster Multimodal Fusion view
-		self.fusion_adj = torch.sqrt(self.text_original_adj * self.text_original_adj + self.image_original_adj * self.image_original_adj) / 2
-		if self.sparse:
-			for i in range(self.n_layers): 
-				fusion_item_embeds = torch.sparse.mm(self.fusion_adj, fusion_item_embeds)
-		else:
-			for i in range(self.n_layers):
-				fusion_item_embeds = torch.mm(self.fusion_adj, fusion_item_embeds)
-		fusion_user_embeds = torch.sparse.mm(self.R, fusion_item_embeds)
-		# multimodal interest aware(mmia)
-		mmia, low_freq_interest, high_freq_interest = self.mm_wavelet_interest_aware(image_item_embeds, text_item_embeds, fusion_item_embeds)
-	
-		fusion_embeds = torch.cat([fusion_user_embeds, fusion_item_embeds + mmia], dim=0)
-
-
-		#   Modality-aware Preference Module
-		fusion_att_v, fusion_att_t = self.query_v(fusion_embeds), self.query_t(fusion_embeds)
-		fusion_soft_v = self.softmax(fusion_att_v)
-		agg_image_embeds = fusion_soft_v * image_embeds
-
-		fusion_soft_t = self.softmax(fusion_att_t)
-		agg_text_embeds = fusion_soft_t * text_embeds
-
-		# 模态偏好感知
-		image_prefer = self.gate_image_prefer(content_embeds)
-		text_prefer = self.gate_text_prefer(content_embeds)
-		fusion_prefer = self.gate_fusion_prefer(content_embeds)
-		image_prefer, text_prefer, fusion_prefer = self.dropout(image_prefer), self.dropout(text_prefer), self.dropout(fusion_prefer)
-		# print("image_prefer.shape:", image_prefer.shape, "text_prefer.shape:", text_prefer.shape, "fusion_prefer.shape:", fusion_prefer.shape)
-		# print("agg_image_embeds.shape:", agg_image_embeds.shape, "agg_text_embeds.shape:", agg_text_embeds.shape, "fusion_embeds.shape:", fusion_embeds.shape)
-		'''
-		content_embeds.shape: torch.Size([26495, 64])
-		image_prefer.shape: torch.Size([26495, 64]) text_prefer.shape: torch.Size([26495, 64]) fusion_prefer.shape: torch.Size([26495, 64])
-		agg_image_embeds.shape: torch.Size([26495, 64]) agg_text_embeds.shape: torch.Size([26495, 64]) fusion_embeds.shape: torch.Size([26495, 64])
-		'''
-		agg_image_embeds = torch.multiply(image_prefer, agg_image_embeds) # 图像模态偏好感知
-		agg_text_embeds = torch.multiply(text_prefer, agg_text_embeds) # 文本模态偏好感知
-		fusion_embeds = torch.multiply(fusion_prefer, fusion_embeds) # 兴趣偏好感知
-		# 公共兴趣和个性化兴趣偏好感知
-		# fusion_embeds = self.mm_wavelet_interest_aware(content_embeds, fusion_embeds)
-		#fusion_embeds = self.mm_wavelet_interest_aware(agg_image_embeds, agg_text_embeds)
-		#print("fusion_embeds:", fusion_embeds)
-		# print("content_embeds.shape:", content_embeds.shape)
-
-		# TODO: Ablation Study2: TODO MMWI
-		if self.MMWI:
-			side_embeds = torch.mean(torch.stack([agg_image_embeds, agg_text_embeds, fusion_embeds]), dim=0) 
-		else:
-			side_embeds = torch.mean(torch.stack([image_embeds, text_embeds]), dim=0) 
-
-
-		
-		# if self.MMWI:
-		# 	all_embeds, low_freq_interest, high_freq_interest = self.mm_wavelet_interest_aware(content_embeds, side_embeds)
-		# else:
-		all_embeds = content_embeds + side_embeds
-		# low_freq_interest, high_freq_interest = 0, 0
-		all_embeddings_users, all_embeddings_items = torch.split(all_embeds, [self.n_users, self.n_items], dim=0)
-
-		if train:
-			return all_embeddings_users, all_embeddings_items, side_embeds, content_embeds, low_freq_interest, high_freq_interest
-
-		return all_embeddings_users, all_embeddings_items
-
-	def bpr_loss(self, users, pos_items, neg_items):
-		pos_scores = torch.sum(torch.mul(users, pos_items), dim=1)
-		neg_scores = torch.sum(torch.mul(users, neg_items), dim=1)
-
-		regularizer = 1. / 2 * (users ** 2).sum() + 1. / 2 * (pos_items ** 2).sum() + 1. / 2 * (neg_items ** 2).sum()
-		regularizer = regularizer / self.batch_size
-
-		maxi = F.logsigmoid(pos_scores - neg_scores)
-		mf_loss = -torch.mean(maxi)
-
-		emb_loss = self.reg_weight * regularizer
-		reg_loss = 0.0
-		return mf_loss, emb_loss, reg_loss
-
-	def InfoNCE(self, view1, view2, temperature):
-		view1, view2 = F.normalize(view1, dim=1), F.normalize(view2, dim=1)
-		pos_score = (view1 * view2).sum(dim=-1)
-		pos_score = torch.exp(pos_score / temperature)
-		ttl_score = torch.matmul(view1, view2.transpose(0, 1))
-		ttl_score = torch.exp(ttl_score / temperature).sum(dim=1)
-		cl_loss = -torch.log(pos_score / ttl_score)
-		return torch.mean(cl_loss)
-
-	def calculate_loss(self, interaction):
-		users = interaction[0]
-		pos_items = interaction[1]
-		neg_items = interaction[2]
-
-		ua_embeddings, ia_embeddings, side_embeds, content_embeds, low_freq_interest, high_freq_interest = self.forward(
-			self.norm_adj, train=True)
-
-		u_g_embeddings = ua_embeddings[users]
-		pos_i_g_embeddings = ia_embeddings[pos_items]
-		neg_i_g_embeddings = ia_embeddings[neg_items]
-
-		batch_mf_loss, batch_emb_loss, batch_reg_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings,
-																	  neg_i_g_embeddings)
-
-		side_embeds_users, side_embeds_items = torch.split(side_embeds, [self.n_users, self.n_items], dim=0)
-		content_embeds_user, content_embeds_items = torch.split(content_embeds, [self.n_users, self.n_items], dim=0)
-
-		#item-item constractive loss
-		cl_loss1 = self.InfoNCE(side_embeds_items[pos_items], content_embeds_items[pos_items], self.temperature) + self.InfoNCE(side_embeds_users[users], content_embeds_user[users], self.temperature) 
-		#user-item constractive loss
-		#cl_loss2 = self.InfoNCE(u_g_embeddings, content_embeds_items[pos_items], 0.2) + self.InfoNCE(u_g_embeddings, side_embeds_items[pos_items], 0.2)
-
-		# hot-interest cold-interest
-		# TODO: Abstudy Study MCL
-		if self.MMCL:
-			cl_loss2 =self.InfoNCE(low_freq_interest, high_freq_interest, self.temperature)
-		else:
-			cl_loss2 = 0
-			# low_freq_embeds_users, low_freq_embeds_items = torch.split(low_freq_interest, [self.n_users, self.n_items], dim=0)
-			# high_freq_embeds_user, high_freq_embeds_items = torch.split(high_freq_interest, [self.n_users, self.n_items], dim=0)
-			# cl_loss3 = self.InfoNCE(low_freq_embeds_items[pos_items], high_freq_embeds_items[pos_items], 0.2) + self.InfoNCE(low_freq_embeds_users[users], high_freq_embeds_user[users], 0.2)
-		# else:
-		# 	cl_loss3 = 0.0
-
-		# return batch_mf_loss + batch_emb_loss + batch_reg_loss + self.cl_loss * cl_loss1 + self.cl_loss * 0.1 * cl_loss2 + self.cl_loss * 0.1 * cl_loss3
-		#return batch_mf_loss + batch_emb_loss + batch_reg_loss + self.cl_loss1 * cl_loss1 + self.cl_loss2  * cl_loss2 + self.cl_loss3 * cl_loss3
-		return batch_mf_loss + batch_emb_loss + batch_reg_loss + self.cl_loss1 * cl_loss1  + self.cl_loss2  * 0.1 * cl_loss2
-
-	def full_sort_predict(self, interaction):
-		user = interaction[0]
-
-		restore_user_e, restore_item_e = self.forward(self.norm_adj)
-		u_embeddings = restore_user_e[user]
-
-		# dot with all item embedding to accelerate
-		scores = torch.matmul(u_embeddings, restore_item_e.transpose(0, 1))
-		return scores
-
-
-
-class VisualModalExpertNetwork(nn.Module):  
-	def __init__(self, in_features):  
-		'''  
-		in_features :param in_features: visual features  
-		Usage:  
-			in_features = 4096  
-			network = VisualModalExpertNetwork(in_features)  
-			x = torch.randn(7050, 4096)  
-			output = network(x)  
-			print(output.shape)  # [7050, 64]  # Note: The final output shape will be [7050, 64] not [7050, 4096]  
-		'''  
-		super(VisualModalExpertNetwork, self).__init__()  
-		self.in_features = in_features  
-  
-		self.build_visual_modal_expert_network()  
-		self.init_weights()  # Initialize weights using Xavier Uniform  
-  
-	def build_visual_modal_expert_network(self):  
-		'''  
-		build a visual modal expert network  
-		'''  
-		self.visual_model_expert_network = nn.Sequential(  
-			# Downsampling  
-			nn.BatchNorm1d(self.in_features),  
-			nn.Linear(in_features=self.in_features, out_features=1024),  
-			nn.BatchNorm1d(1024),  
-			nn.ReLU(),  
-			nn.Dropout(),  
-  
-			nn.Linear(in_features=1024, out_features=512),  
-			nn.BatchNorm1d(512),  
-			nn.ReLU(),  
-			nn.Dropout(),  
-  
-			nn.Linear(in_features=512, out_features=64),  
-			nn.BatchNorm1d(64),  
-			nn.ReLU(),  
-			nn.Dropout()  
-
-		)  
-  
-	def init_weights(self):  
-		'''  
-		Initialize the weights of the network using Xavier Uniform initialization  
-		'''  
-		for m in self.modules():  
-			if isinstance(m, nn.Linear):  
-				nn.init.xavier_uniform_(m.weight)  
-				if m.bias is not None:  
-					nn.init.zeros_(m.bias)  
-  
-	def forward(self, x):  
-		'''  
-		forward:  
-		:param x: visual features ,[7050, 4096]  
-		:return: [7050, 64]  # Note: The final output shape will be [7050, 64] not [7050, 4096]  
-		'''  
-		return self.visual_model_expert_network(x) 
-  
-class TextModalExpertNetwork(nn.Module):  
-	def __init__(self, in_features):  
-		'''  
-		in_features :param in_features: visual features  
-		Usage:  
-			in_features = 4096  
-			network = VisualModalExpertNetwork(in_features)  
-			x = torch.randn(7050, 4096)  
-			output = network(x)  
-			print(output.shape)  # [7050, 64]  # Note: The output shape will be [7050, 64] not [7050, 4096]  
-		'''  
-		super(TextModalExpertNetwork, self).__init__()  
-  
-		self.in_features = in_features  
-  
-		self.build_text_modal_expert_network()  
-		  
-		# Initialize weights using Xavier Uniform  
-		self.init_weights()  
-  
-	def build_text_modal_expert_network(self):  
-		'''  
-			build a text modal expert network  
-		'''  
-		self.text_model_expert_network = nn.Sequential(  
-			# Downsampling  
-			nn.BatchNorm1d(self.in_features),  
-			nn.Linear(in_features=self.in_features, out_features=256),  
-			nn.BatchNorm1d(256),  
-			nn.ReLU(),  
-			nn.Dropout(),  
-			nn.Linear(in_features=256, out_features=128),  
-			nn.BatchNorm1d(128),  
-			nn.ReLU(),  
-			nn.Dropout(),  
-			nn.Linear(in_features=128, out_features=64),  
-			nn.BatchNorm1d(64),  
-			nn.ReLU(),  
-			nn.Dropout()  
-
-		)  
-  
-	def init_weights(self):  
-		'''  
-		Initialize the weights of the network using Xavier Uniform initialization  
-		'''  
-		for m in self.modules():  
-			if isinstance(m, nn.Linear):  
-				nn.init.xavier_uniform_(m.weight)  
-				if m.bias is not None:  
-					nn.init.zeros_(m.bias)  
-  
-	def forward(self, x):  
-		'''  
-		forward:  
-		:param x: text features ,[7050, 4096]  
-		:return: [7050, 64]  # Note: The return shape is [7050, 64] as per the defined network  
-		'''  
-		return self.text_model_expert_network(x)  
-
-
-
-def denoise_norm(emb1, weight=0.1):
-	'''
-		embedding denoise function
-	'''
-	# 核范数降噪
-	# print("weight:", weight, "weight.item:", weight.item())
-	# weight = weight.cuda()
-	nuclear_norm_emb1= torch.linalg.svdvals(emb1).sum()
-
-	# 可以根据需要调整核范数的权重
-	# print("emb1.device:", emb1.device, "weight.device:", weight.device, "nuclear_norm_emb1:", nuclear_norm_emb1.device)
-	emb1_norm = emb1 - weight * nuclear_norm_emb1
-
-	return emb1_norm
+import numpy as np
+from pytorch_wavelets import DWT1D
+from scipy.stats import dirichlet
+
+class PNG(nn.Module):
+    """
+    User-Item Popular Niche Interest Graph (UIG)模型
+    基于小波变换提取用户-物品交互图中的流行兴趣和小众兴趣，优化内存版本
+    所有张量强制为float32类型，避免类型冲突
+    """
+    def __init__(self, R: torch.Tensor, wavelet='db3', level=3, device='cuda:0'):
+        super(PNG, self).__init__()
+        # 强制输入矩阵为float32类型（核心修改）
+        self.R = R.coalesce().to(device).to(dtype=torch.float32)
+        self.device = device
+        self.wavelet = wavelet
+        self.level = level
+        self.dtype = torch.float32  # 统一类型标识
+        
+        # 矩阵维度
+        self.num_users = R.size(0)
+        self.num_items = R.size(1)
+        
+        # 小波变换层（共享权重）
+        self.dwt = DWT1D(wave=wavelet, J=level).to(device)
+        
+        # 预计算索引和值（已为float32）
+        self.indices = self.R.indices()  # [2, nnz]
+        self.values = self.R.values()    # [nnz]（float32）
+        
+        # 存储中间结果（延迟计算）
+        self.item_popularity = None
+        self.user_activity = None
+        self.user_low = None  # 用户低频系数（大众兴趣）
+        self.user_high = None # 用户高频系数（小众兴趣）
+        self.item_low = None  # 物品低频系数（大众兴趣）
+        self.item_high = None # 物品高频系数（小众兴趣）
+        
+        # 输出结果
+        self.UIPG = None
+        self.UING = None
+        self.quadrants = None
+
+    def _compute_item_popularity(self):
+        """计算物品流行度（强制float32）"""
+        if self.item_popularity is None:
+            # 初始化流行度向量（显式指定float32）
+            pop = torch.zeros(self.num_items, device=self.device, dtype=self.dtype)
+            # 按物品索引累加交互值（带对数惩罚）
+            counts = torch.bincount(self.indices[1], minlength=self.num_items)
+            log_counts = torch.log1p(counts.to(self.dtype))  # 确保log_counts为float32
+            pop.scatter_add_(0, self.indices[1], self.values * log_counts[self.indices[1]])
+            # 归一化（L2范数）
+            self.item_popularity = pop / (torch.norm(pop) + 1e-8)
+        return self.item_popularity
+
+    def _compute_user_activity(self):
+        """计算用户活跃度（强制float32）"""
+        if self.user_activity is None:
+            # 初始化活跃度向量（显式指定float32）
+            act = torch.zeros(self.num_users, device=self.device, dtype=self.dtype)
+            # 依赖物品流行度
+            pop = self._compute_item_popularity()
+            # 按用户索引累加（除以流行度惩罚）
+            pop_vals = pop[self.indices[1]] + 1e-8  # 避免除零
+            act.scatter_add_(0, self.indices[0], self.values / torch.log1p(pop_vals))
+            # 归一化（L2范数）
+            self.user_activity = act / (torch.norm(act) + 1e-8)
+        return self.user_activity
+
+    def _get_user_signals(self, user_idx):
+        """生成单个用户的交互信号（强制float32）"""
+        mask = (self.indices[0] == user_idx)
+        item_ids = self.indices[1][mask]
+        vals = self.values[mask]
+        
+        # 构建信号向量（显式指定float32）
+        signal = torch.zeros(self.num_items, device=self.device, dtype=self.dtype)
+        signal[item_ids] = vals * (1 + self.user_activity[user_idx])
+        return signal.unsqueeze(0).unsqueeze(0)  # [1,1,D]
+
+    def _get_item_signals(self, item_idx):
+        """生成单个物品的交互信号（强制float32）"""
+        mask = (self.indices[1] == item_idx)
+        user_ids = self.indices[0][mask]
+        vals = self.values[mask]
+        
+        # 构建信号向量（显式指定float32）
+        signal = torch.zeros(self.num_users, device=self.device, dtype=self.dtype)
+        signal[user_ids] = vals * (1 + self.item_popularity[item_idx])
+        return signal.unsqueeze(0).unsqueeze(0)  # [1,1,D]
+
+    def _wavelet_transform_batch(self, is_user=True, batch_size=32):
+        """批量小波变换（强制float32）"""
+        num_entities = self.num_users if is_user else self.num_items
+        # 初始化低频/高频张量（显式指定float32）
+        low_freq = torch.zeros(num_entities, device=self.device, dtype=self.dtype)
+        high_freq = torch.zeros(num_entities, device=self.device, dtype=self.dtype)
+        
+        # 分批次处理
+        for start in range(0, num_entities, batch_size):
+            end = min(start + batch_size, num_entities)
+            batch_low = []
+            batch_high = []
+            
+            for idx in range(start, end):
+                # 获取信号（用户/物品）
+                if is_user:
+                    signal = self._get_user_signals(idx)
+                else:
+                    signal = self._get_item_signals(idx)
+                
+                # 小波变换
+                lf, hf_list = self.dwt(signal)
+                # 低频系数：全局趋势（取均值）
+                batch_low.append(torch.mean(lf).item())  # 转为Python标量，避免类型冲突
+                # 高频系数：细节变化（取能量和）
+                hf_energy = torch.sum(torch.stack([torch.norm(hf) for hf in hf_list])).item()
+                batch_high.append(hf_energy)
+            
+            # 批量写入结果（确保float32）
+            low_freq[start:end] = torch.tensor(batch_low, device=self.device, dtype=self.dtype)
+            high_freq[start:end] = torch.tensor(batch_high, device=self.device, dtype=self.dtype)
+        
+        return low_freq, high_freq
+
+    def _dirichlet_weight(self, low, high):
+        """基于Dirichlet分布计算权重（输出float32）"""
+        # 确保alpha为正值且为float32
+        alpha_low = torch.clamp(low, min=1e-6)
+        alpha_high = torch.clamp(high, min=1e-6)
+        # 归一化alpha
+        alpha_sum = alpha_low + alpha_high
+        alpha_low /= alpha_sum
+        alpha_high /= alpha_sum
+        
+        # 批量采样Dirichlet分布
+        weights = []
+        for a1, a2 in zip(alpha_low.cpu().numpy(), alpha_high.cpu().numpy()):
+            weights.append(dirichlet.rvs([a1*10, a2*10], size=1)[0, 0])
+        
+        # 转换为float32张量
+        return torch.tensor(weights, device=self.device, dtype=self.dtype)
+
+    def forward(self):
+        """前向传播（所有输出强制为float32）"""
+        # 1. 计算基础指标
+        self._compute_item_popularity()
+        self._compute_user_activity()
+        
+        # 2. 小波变换（分用户和物品）
+        print("处理用户信号...")
+        self.user_low, self.user_high = self._wavelet_transform_batch(is_user=True)
+        print("处理物品信号...")
+        self.item_low, self.item_high = self._wavelet_transform_batch(is_user=False)
+        
+        # 3. Dirichlet权重计算
+        user_pop_weight = self._dirichlet_weight(self.user_low, self.user_high)  # [U]
+        item_pop_weight = self._dirichlet_weight(self.item_low, self.item_high)  # [I]
+        user_niche_weight = 1 - user_pop_weight
+        item_niche_weight = 1 - item_pop_weight
+        
+        # 4. 构建兴趣图（稀疏表示，强制float32）
+        # 流行兴趣图：用户大众权重 × 物品大众权重 × 交互值
+        uipg_vals = self.values * user_pop_weight[self.indices[0]] * item_pop_weight[self.indices[1]]
+        self.UIPG = torch.sparse_coo_tensor(
+            self.indices, 
+            uipg_vals,  # 已为float32
+            (self.num_users, self.num_items), 
+            device=self.device,
+            dtype=self.dtype  # 显式指定为float32
+        )
+        
+        # 小众兴趣图
+        uing_vals = self.values * user_niche_weight[self.indices[0]] * item_niche_weight[self.indices[1]]
+        self.UING = torch.sparse_coo_tensor(
+            self.indices, 
+            uing_vals, 
+            (self.num_users, self.num_items), 
+            device=self.device,
+            dtype=self.dtype
+        )
+        
+        # 5. 四象限表征（稀疏存储，float32）
+        self.quadrants = {
+            'pop_user_pop_item': torch.sparse_coo_tensor(
+                self.indices, 
+                self.values * user_pop_weight[self.indices[0]] * item_pop_weight[self.indices[1]],
+                (self.num_users, self.num_items), 
+                device=self.device,
+                dtype=self.dtype
+            ),
+            'pop_user_niche_item': torch.sparse_coo_tensor(
+                self.indices, 
+                self.values * user_pop_weight[self.indices[0]] * item_niche_weight[self.indices[1]],
+                (self.num_users, self.num_items), 
+                device=self.device,
+                dtype=self.dtype
+            ),
+            'niche_user_pop_item': torch.sparse_coo_tensor(
+                self.indices, 
+                self.values * user_niche_weight[self.indices[0]] * item_pop_weight[self.indices[1]],
+                (self.num_users, self.num_items), 
+                device=self.device,
+                dtype=self.dtype
+            ),
+            'niche_user_niche_item': torch.sparse_coo_tensor(
+                self.indices, 
+                self.values * user_niche_weight[self.indices[0]] * item_niche_weight[self.indices[1]],
+                (self.num_users, self.num_items), 
+                device=self.device,
+                dtype=self.dtype
+            )
+        }
+        
+        return self.UIPG, self.UING, self.quadrants
+    
+# 测试用例（模拟大规模稀疏矩阵）
+def test_uig_memory_efficiency():
+    # 生成19445×7050的稀疏矩阵（模拟输入）
+    num_users, num_items = 19445, 7050
+    nnz = 118551  # 非零元素数量
+    
+    # 随机生成交互数据
+    user_idx = torch.randint(0, num_users, (nnz,))
+    item_idx = torch.randint(0, num_items, (nnz,))
+    values = torch.rand(nnz) * 0.5  # 交互强度
+    
+    # 构建稀疏矩阵
+    indices = torch.stack([user_idx, item_idx])
+    R = torch.sparse_coo_tensor(indices, values, (num_users, num_items), device='cuda:0')
+    
+    # 模型测试
+    model = UIG(R, wavelet='db3', level=2)
+    UIPG, UING, quads = model.forward()
+    print("quads:", quads['pop_user_pop_item'].to_dense())
+    # 验证结果
+    print(f"UIPG 非零元素: {UIPG._nnz()}")
+    print(f"UING 非零元素: {UING._nnz()}")
+    print(f"四象限非零元素: {[quads[k]._nnz() for k in quads]}")
+    
+    # 内存使用检查
+    print(f"用户低频系数内存: {model.user_low.element_size() * model.user_low.nelement() / 1024 / 1024:.2f} MB")
+    print(f"物品高频系数内存: {model.item_high.element_size() * model.item_high.nelement() / 1024 / 1024:.2f} MB")
+
+# if __name__ == "__main__":
+#     test_uig_memory_efficiency()
